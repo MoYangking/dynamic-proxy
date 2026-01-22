@@ -931,26 +931,7 @@ func main() {
 	strictPool := NewProxyPool()
 	relaxedPool := NewProxyPool()
 
-	// Start proxy updater with initial synchronous update
-	startProxyUpdater(strictPool, relaxedPool, true)
-
-	// Check proxy pool status
-	strictCount := len(strictPool.GetAll())
-	relaxedCount := len(relaxedPool.GetAll())
-
-	if strictCount == 0 {
-		log.Println("[STRICT] Warning: No healthy proxies available")
-		log.Println("[STRICT] Strict mode servers will return errors until proxies become available")
-	} else {
-		log.Printf("[STRICT] Successfully loaded %d healthy proxies", strictCount)
-	}
-
-	if relaxedCount == 0 {
-		log.Println("[RELAXED] Warning: No healthy proxies available")
-		log.Println("[RELAXED] Relaxed mode servers will return errors until proxies become available")
-	} else {
-		log.Printf("[RELAXED] Successfully loaded %d healthy proxies", relaxedCount)
-	}
+	log.Println("Starting servers first to pass health checks...")
 
 	// Start servers (5 servers total)
 	var wg sync.WaitGroup
@@ -1000,6 +981,24 @@ func main() {
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
 	log.Println("  [MONITOR] Web: " + config.Ports.WebMonitor)
+	
+	// Start proxy updater in background (async to allow health checks to pass immediately)
+	log.Println("Starting proxy pool updater in background...")
+	go func() {
+		updateProxyPool(strictPool, relaxedPool)
+		strictCount := len(strictPool.GetAll())
+		relaxedCount := len(relaxedPool.GetAll())
+		if strictCount > 0 {
+			log.Printf("[STRICT] Successfully loaded %d healthy proxies", strictCount)
+		}
+		if relaxedCount > 0 {
+			log.Printf("[RELAXED] Successfully loaded %d healthy proxies", relaxedCount)
+		}
+	}()
+	
+	// Start periodic updater
+	startProxyUpdater(strictPool, relaxedPool, false)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
+	
 	wg.Wait()
 }
