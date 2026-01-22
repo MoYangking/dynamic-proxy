@@ -36,6 +36,7 @@ type Config struct {
 		SOCKS5Relaxed  string `yaml:"socks5_relaxed"`
 		HTTPStrict     string `yaml:"http_strict"`
 		HTTPRelaxed    string `yaml:"http_relaxed"`
+		WebMonitor     string `yaml:"web_monitor"`
 	} `yaml:"ports"`
 }
 
@@ -86,12 +87,23 @@ func loadConfig(filename string) (*Config, error) {
 	if cfg.Ports.HTTPRelaxed == "" {
 		cfg.Ports.HTTPRelaxed = ":8082"
 	}
+	if cfg.Ports.WebMonitor == "" {
+		cfg.Ports.WebMonitor = ":8888"
+	}
 
 	return &cfg, nil
 }
 
+type ProxyStats struct {
+	Address    string
+	Latency    time.Duration
+	LastCheck  time.Time
+	Available  bool
+}
+
 type ProxyPool struct {
 	proxies   []string
+	stats     map[string]*ProxyStats
 	mu        sync.RWMutex
 	index     uint64
 	updating  int32 // atomic flag to prevent concurrent updates
@@ -100,6 +112,7 @@ type ProxyPool struct {
 func NewProxyPool() *ProxyPool {
 	return &ProxyPool{
 		proxies: make([]string, 0),
+		stats:   make(map[string]*ProxyStats),
 	}
 }
 
@@ -133,6 +146,27 @@ func (p *ProxyPool) GetAll() []string {
 	result := make([]string, len(p.proxies))
 	copy(result, p.proxies)
 	return result
+}
+
+func (p *ProxyPool) GetStats() []ProxyStats {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	result := make([]ProxyStats, 0, len(p.stats))
+	for _, stat := range p.stats {
+		result = append(result, *stat)
+	}
+	return result
+}
+
+func (p *ProxyPool) UpdateStats(addr string, latency time.Duration, available bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.stats[addr] = &ProxyStats{
+		Address:   addr,
+		Latency:   latency,
+		LastCheck: time.Now(),
+		Available: available,
+	}
 }
 
 // parseSpecialProxyURL 使用简单正则表达式从复杂格式中提取代理
@@ -281,7 +315,7 @@ func fetchProxyList() ([]string, error) {
 	return allProxies, nil
 }
 
-func checkProxyHealth(proxyAddr string, strictMode bool) bool {
+func checkProxyHealth(proxyAddr string, strictMode bool) (bool, time.Duration) {
 	// Create a context with timeout from config
 	totalTimeout := time.Duration(config.HealthCheck.TotalTimeoutSeconds) * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), totalTimeout)
@@ -289,18 +323,22 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 
 	dialer, err := proxy.SOCKS5("tcp", proxyAddr, nil, proxy.Direct)
 	if err != nil {
-		return false
+		return false, 0
 	}
 
 	// Use a channel to handle timeout
-	done := make(chan bool, 1)
+	type result struct {
+		ok      bool
+		latency time.Duration
+	}
+	done := make(chan result, 1)
 	go func() {
 		// Test HTTPS connection to verify TLS handshake works and is fast
 		start := time.Now()
 
 		conn, err := dialer.Dial("tcp", "www.google.com:443")
 		if err != nil {
-			done <- false
+			done <- result{false, 0}
 			return
 		}
 		defer conn.Close()
@@ -313,7 +351,7 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 
 		err = tlsConn.Handshake()
 		if err != nil {
-			done <- false
+			done <- result{false, 0}
 			return
 		}
 		tlsConn.Close()
@@ -323,18 +361,18 @@ func checkProxyHealth(proxyAddr string, strictMode bool) bool {
 		threshold := time.Duration(config.HealthCheck.TLSHandshakeThresholdSeconds) * time.Second
 		if elapsed > threshold {
 			// Too slow, reject this proxy
-			done <- false
+			done <- result{false, elapsed}
 			return
 		}
 
-		done <- true
+		done <- result{true, elapsed}
 	}()
 
 	select {
-	case result := <-done:
-		return result
+	case res := <-done:
+		return res.ok, res.latency
 	case <-ctx.Done():
-		return false
+		return false, 0
 	}
 }
 
@@ -344,7 +382,7 @@ type HealthCheckResult struct {
 	Relaxed []string
 }
 
-func healthCheckProxies(proxies []string) HealthCheckResult {
+func healthCheckProxies(proxies []string, strictPool *ProxyPool, relaxedPool *ProxyPool) HealthCheckResult {
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 	strictHealthy := make([]string, 0)
@@ -401,7 +439,7 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 			defer func() { <-semaphore }()
 
 			// Optimized: check strict mode first
-			strictOK := checkProxyHealth(addr, true)
+			strictOK, latency := checkProxyHealth(addr, true)
 
 			if strictOK {
 				// If strict mode passes, relaxed mode must pass too
@@ -411,14 +449,20 @@ func healthCheckProxies(proxies []string) HealthCheckResult {
 				mu.Unlock()
 				atomic.AddInt64(&strictCount, 1)
 				atomic.AddInt64(&relaxedCount, 1)
+				strictPool.UpdateStats(addr, latency, true)
+				relaxedPool.UpdateStats(addr, latency, true)
 			} else {
 				// Strict mode failed, try relaxed mode
-				relaxedOK := checkProxyHealth(addr, false)
+				relaxedOK, relaxedLatency := checkProxyHealth(addr, false)
 				if relaxedOK {
 					mu.Lock()
 					relaxedHealthy = append(relaxedHealthy, addr)
 					mu.Unlock()
 					atomic.AddInt64(&relaxedCount, 1)
+					relaxedPool.UpdateStats(addr, relaxedLatency, true)
+				} else {
+					strictPool.UpdateStats(addr, 0, false)
+					relaxedPool.UpdateStats(addr, 0, false)
 				}
 			}
 			atomic.AddInt64(&checked, 1)
@@ -454,7 +498,7 @@ func updateProxyPool(strictPool *ProxyPool, relaxedPool *ProxyPool) {
 	}
 
 	log.Printf("Fetched %d proxies, starting health check...", len(proxies))
-	result := healthCheckProxies(proxies)
+	result := healthCheckProxies(proxies, strictPool, relaxedPool)
 
 	// Update strict pool
 	if len(result.Strict) > 0 {
@@ -735,6 +779,127 @@ func startHTTPServer(pool *ProxyPool, port string, mode string) error {
 	return server.ListenAndServe()
 }
 
+// Web Monitor Server
+func startWebMonitor(strictPool *ProxyPool, relaxedPool *ProxyPool, port string) error {
+	mux := http.NewServeMux()
+	
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		html := `<!DOCTYPE html>
+<html><head><meta charset="UTF-8"><title>代理监控</title>
+<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}
+.container{max-width:1400px;margin:0 auto}h1{color:#333}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0}
+.stat-card{background:white;padding:15px;border-radius:8px;box-shadow:0 2px 4px rgba(0,0,0,0.1)}
+.stat-card h3{margin:0 0 10px 0;color:#666;font-size:14px}
+.stat-card .value{font-size:32px;font-weight:bold;color:#2196F3}
+table{width:100%;border-collapse:collapse;background:white;box-shadow:0 2px 4px rgba(0,0,0,0.1);margin:20px 0}
+th,td{padding:12px;text-align:left;border-bottom:1px solid #ddd}
+th{background:#2196F3;color:white;font-weight:bold}
+tr:hover{background:#f5f5f5}
+.available{color:#4CAF50;font-weight:bold}
+.unavailable{color:#f44336;font-weight:bold}
+.latency{color:#FF9800}
+.mode-section{margin:30px 0}
+.mode-title{background:#333;color:white;padding:10px 15px;border-radius:8px 8px 0 0;margin:0}
+</style>
+<script>setInterval(()=>location.reload(),10000)</script>
+</head><body><div class="container"><h1>🔍 代理监控面板</h1>
+<div class="stats">
+<div class="stat-card"><h3>严格模式代理</h3><div class="value" id="strict-count">-</div></div>
+<div class="stat-card"><h3>宽松模式代理</h3><div class="value" id="relaxed-count">-</div></div>
+<div class="stat-card"><h3>更新间隔</h3><div class="value">` + fmt.Sprintf("%d分钟", config.UpdateIntervalMinutes) + `</div></div>
+</div>
+<div class="mode-section"><h2 class="mode-title">严格模式代理列表</h2>
+<table><thead><tr><th>代理地址</th><th>状态</th><th>延迟</th><th>最后检查</th></tr></thead>
+<tbody id="strict-table"></tbody></table></div>
+<div class="mode-section"><h2 class="mode-title">宽松模式代理列表</h2>
+<table><thead><tr><th>代理地址</th><th>状态</th><th>延迟</th><th>最后检查</th></tr></thead>
+<tbody id="relaxed-table"></tbody></table></div>
+<script>
+fetch('/api/stats').then(r=>r.json()).then(data=>{
+document.getElementById('strict-count').textContent=data.strict.count;
+document.getElementById('relaxed-count').textContent=data.relaxed.count;
+const renderTable=(stats,id)=>{
+const tbody=document.getElementById(id);
+tbody.innerHTML=stats.map(s=>'<tr><td>'+s.address+'</td><td class="'+(s.available?'available':'unavailable')+'">'+(s.available?'✓ 可用':'✗ 不可用')+'</td><td class="latency">'+(s.latency||'-')+'</td><td>'+s.last_check+'</td></tr>').join('');
+};
+renderTable(data.strict.proxies,'strict-table');
+renderTable(data.relaxed.proxies,'relaxed-table');
+});
+</script></div></body></html>`
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(html))
+	})
+	
+	mux.HandleFunc("/api/stats", func(w http.ResponseWriter, r *http.Request) {
+		strictStats := strictPool.GetStats()
+		relaxedStats := relaxedPool.GetStats()
+		
+		formatStats := func(stats []ProxyStats) []map[string]interface{} {
+			result := make([]map[string]interface{}, 0, len(stats))
+			for _, s := range stats {
+				latency := "-"
+				if s.Latency > 0 {
+					latency = fmt.Sprintf("%.0fms", s.Latency.Seconds()*1000)
+				}
+				result = append(result, map[string]interface{}{
+					"address":    s.Address,
+					"available":  s.Available,
+					"latency":    latency,
+					"last_check": s.LastCheck.Format("2006-01-02 15:04:05"),
+				})
+			}
+			return result
+		}
+		
+		response := map[string]interface{}{
+			"strict": map[string]interface{}{
+				"count":   len(strictPool.GetAll()),
+				"proxies": formatStats(strictStats),
+			},
+			"relaxed": map[string]interface{}{
+				"count":   len(relaxedPool.GetAll()),
+				"proxies": formatStats(relaxedStats),
+			},
+		}
+		
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		json := fmt.Sprintf(`{"strict":{"count":%d,"proxies":%v},"relaxed":{"count":%d,"proxies":%v}}`,
+			response["strict"].(map[string]interface{})["count"],
+			formatJSON(response["strict"].(map[string]interface{})["proxies"]),
+			response["relaxed"].(map[string]interface{})["count"],
+			formatJSON(response["relaxed"].(map[string]interface{})["proxies"]))
+		w.Write([]byte(json))
+	})
+	
+	log.Printf("[MONITOR] Web monitor listening on %s", port)
+	return http.ListenAndServe(port, mux)
+}
+
+func formatJSON(data interface{}) string {
+	switch v := data.(type) {
+	case []map[string]interface{}:
+		items := make([]string, len(v))
+		for i, item := range v {
+			fields := make([]string, 0)
+			for k, val := range item {
+				switch val.(type) {
+				case string:
+					fields = append(fields, fmt.Sprintf(`"%s":"%v"`, k, val))
+				case bool:
+					fields = append(fields, fmt.Sprintf(`"%s":%v`, k, val))
+				default:
+					fields = append(fields, fmt.Sprintf(`"%s":"%v"`, k, val))
+				}
+			}
+			items[i] = "{" + strings.Join(fields, ",") + "}"
+		}
+		return "[" + strings.Join(items, ",") + "]"
+	}
+	return "[]"
+}
+
 func main() {
 	log.Println("Starting Dynamic Proxy Server...")
 
@@ -760,6 +925,7 @@ func main() {
 	log.Printf("  - SOCKS5 Relaxed port: %s", config.Ports.SOCKS5Relaxed)
 	log.Printf("  - HTTP Strict port: %s", config.Ports.HTTPStrict)
 	log.Printf("  - HTTP Relaxed port: %s", config.Ports.HTTPRelaxed)
+	log.Printf("  - Web Monitor port: %s", config.Ports.WebMonitor)
 
 	// Create two proxy pools
 	strictPool := NewProxyPool()
@@ -786,9 +952,9 @@ func main() {
 		log.Printf("[RELAXED] Successfully loaded %d healthy proxies", relaxedCount)
 	}
 
-	// Start servers (4 servers total)
+	// Start servers (5 servers total)
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 
 	// SOCKS5 Strict
 	go func() {
@@ -822,9 +988,18 @@ func main() {
 		}
 	}()
 
+	// Web Monitor
+	go func() {
+		defer wg.Done()
+		if err := startWebMonitor(strictPool, relaxedPool, config.Ports.WebMonitor); err != nil {
+			log.Fatalf("[MONITOR] Web monitor error: %v", err)
+		}
+	}()
+
 	log.Println("All servers started successfully")
 	log.Println("  [STRICT] SOCKS5: " + config.Ports.SOCKS5Strict + " | HTTP: " + config.Ports.HTTPStrict)
 	log.Println("  [RELAXED] SOCKS5: " + config.Ports.SOCKS5Relaxed + " | HTTP: " + config.Ports.HTTPRelaxed)
+	log.Println("  [MONITOR] Web: " + config.Ports.WebMonitor)
 	log.Printf("Proxy pools will update every %d minutes in background...", config.UpdateIntervalMinutes)
 	wg.Wait()
 }
